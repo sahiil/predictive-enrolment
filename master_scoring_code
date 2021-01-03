@@ -1,0 +1,159 @@
+
+# CONFIGURING THE CODE ----------------------------------------------------
+
+options(stringsAsFactors = F)
+rm(list=ls())
+cat('\014')
+if(!("pacman" %in% rownames(installed.packages()))){
+  install.packages("pacman")
+}
+
+require("pacman")
+p_load(growthmodels)
+p_load(dplyr, data.table, stringr)
+p_load(parallel)
+p_load(DBI,odbc)
+
+# setwd('D:\\DCCCD\\StudentCentricScheduling\\predictive_curves')
+
+
+
+self.DB_HOST = '172.21.188.217'  # TODO:Remove this line on PRODUCTION
+self.DB_PORT = '1433'  # TODO:Remove this line on PRODUCTION
+self.DB_USER = 'Srv_sql_DCCCD'  # TODO:Remove this line on PRODUCTION
+self.DB_PW = 'Nolw0@83pqPn'  # TODO:Remove this line on PRODUCTION
+self.DB_NAME = 'dcccd_db'  # TODO:Remove this line on PRODUCTION
+self.DB_DRIVER = 'ODBC Driver 17 for SQL Server'  # TODO:Remove this line on PRODUCTION
+
+cn<-dbConnect(odbc(), 
+              Driver = self.DB_DRIVER, 
+              Server = self.DB_HOST, 
+              Database = self.DB_NAME,
+              UID=self.DB_USER,
+              PWD=self.DB_PW,
+              MultipleActiveResultSets='true'
+)
+
+
+
+source("scoring_function.R")
+
+# SETTING UP INPUT PARAMETERS ---------------------------------------------
+config<-"r_config_scoring.csv"
+df.config <- dbGetQuery(cn,'SELECT * FROM r_config_scoring')
+
+run_semester=filter(df.config,Variable=='sem')$'value'
+ay_default=filter(df.config,Variable=='ay_default')$'value'
+run_ay=filter(df.config,Variable=='ay')$'value'
+df.fname <- paste0("autotest_",run_ay,"_",run_semester) # input dataset
+df.best.fit.fname <- paste0("closest_fit_",ay_default,"_",run_semester) #historical best fits
+
+setwd('..')
+df.raw <- dbGetQuery(cn,sprintf("select * from %s", df.fname))
+df.raw$TIME<-as.numeric(df.raw$TIME)
+df.raw$ENROLLMENT<-as.numeric(df.raw$ENROLLMENT)
+df.raw$FIL<-as.numeric(df.raw$FIL)
+df.raw$max_time<-as.numeric(df.raw$max_time)
+df.raw$TIME_TRIM<-as.numeric(df.raw$TIME_TRIM)
+
+df.best.fit<-dbGetQuery(cn,sprintf("select * from %s", df.best.fit.fname))
+
+n_period = strtoi(filter(df.config,Variable=='predict_upto')$'value')
+
+session = "FALL"
+# FUNCTION FOR SCORING THE GROUP1S -----------------------------------------
+# group=df.best.fit$GROUP1[5]
+# model.df<-df.raw
+score.one.groups <- function(group, best.fit.info, model.df, n_period){
+  # group = df.best.fit$GROUP1[1]
+  # model.df = df
+  # n_period = 145
+  
+  best.fit.info.2018 = df.best.fit[df.best.fit$GROUP1 == group,]$BEST_FIT_2018
+  best.fit.info.2019 = df.best.fit[df.best.fit$GROUP1 == group,]$BEST_FIT_2019
+  
+  
+  # FITTING MODEL FOR 2018 --------------------------------------------------
+  
+  # 
+  if(is.na(best.fit.info.2018)){
+    result.df.2018 <- fit.log(group, model.df)
+  } else if(best.fit.info.2018 == "GOMPERTZ"){
+    result.df.2018 <- fit.gompertz(group, model.df)
+  } else if(best.fit.info.2018 == "WEIBULL"){
+    result.df.2018 <- fit.weibull(group, model.df)
+  } else if(best.fit.info.2018 == "LOGLOGIT"){
+    result.df.2018 <- fit.loglogit(group, model.df)
+  } else if(best.fit.info.2018 == "LINEAR"){
+    result.df.2018 <- fit.linear(group, model.df)
+  } else if(best.fit.info.2018 == "NEGEXP"){
+    result.df.2018 <- fit.negexp(group, model.df)
+  } else{
+    result.df.2018 <- fit.log(group, model.df)
+  }
+  
+  if(length(result.df.2018) <1){
+    result.df.2018 <- fit.log(group, model.df)
+  }
+  # 
+  # FITTING MODEL FOR 2019 --------------------------------------------------
+  
+  if(is.na(best.fit.info.2019)){
+    result.df.2019 <- fit.log(group, model.df)
+  } else if(best.fit.info.2019 == "GOMPERTZ"){
+    result.df.2019 <- fit.gompertz(group, model.df)
+  } else if(best.fit.info.2019 == "WEIBULL"){
+    result.df.2019 <- fit.weibull(group, model.df)
+  } else if(best.fit.info.2019 == "LOGLOGIT"){
+    result.df.2019 <- fit.loglogit(group, model.df)
+  } else if(best.fit.info.2019 == "LINEAR"){
+    result.df.2019 <- fit.linear(group, model.df)
+  } else if(best.fit.info.2019 == "NEGEXP"){
+    result.df.2019 <- fit.negexp(group, model.df)
+  } else{
+    result.df.2019 <- fit.log(group, model.df)
+  }
+  
+  if(length(result.df.2019) <1){
+    result.df.2019 <- fit.log(group, model.df)
+  }
+  
+  names(result.df.2019) <- c("GROUP1", "TIME", "PROJECTION_2019", "TYPE_2019")
+  names(result.df.2018) <- c("GROUP1", "TIME", "PROJECTION_2018", "TYPE_2018")
+  
+  result.skeleton <- data.frame(GROUP1 = group,
+                                TIME = c(1:n_period))
+  result.skeleton <- left_join(result.skeleton, result.df.2018,
+                               by = c("GROUP1" = "GROUP1", "TIME" = "TIME"))
+  
+  
+  result.skeleton <- left_join(result.skeleton, result.df.2019,
+                               by = c("GROUP1" = "GROUP1", "TIME" = "TIME"))
+  return(result.skeleton)
+}
+
+score.all.list <- bind_rows(lapply(unique(df.best.fit$GROUP1), function(x) score.one.groups(x, df.best.fit, df.raw, n_period)))
+
+colnames(df.best.fit)
+
+score.all.list <- left_join(score.all.list, df.best.fit[c('GROUP1','ERROR_2018',"DEFAULT_ERROR_2018","ERROR_2019","DEFAULT_ERROR_2019")],
+                            by = c("GROUP1" = "GROUP1"))
+
+
+score.all.list <- left_join(score.all.list, df.raw[, c("GROUP1", "TIME", "ENROLLMENT")],
+                            by = c("GROUP1" = "GROUP1", "TIME" = "TIME"))
+
+score.all.list <- score.all.list %>%
+  mutate(PROJECTION_2018 = ifelse(is.na(score.all.list$ENROLLMENT), PROJECTION_2018, NA))%>%
+  mutate(PROJECTION_2019 = ifelse(is.na(score.all.list$ENROLLMENT), PROJECTION_2019, NA))
+
+score.all.list$SESSION <- session
+
+
+system.time(
+  cn %>% dbWriteTable(
+    paste0("scored_models_",run_ay,"_",run_semester),
+    score.all.list, overwrite = TRUE
+  )
+)
+
