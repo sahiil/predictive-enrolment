@@ -1,0 +1,724 @@
+#Loading dependent libraries
+import pandas as pd
+import os
+import subprocess
+import yaml
+import numpy as np
+from yaml import load, dump
+import numpy as np
+import predictive_curves.helper_functions
+import predictive_curves.fillrate
+import predictive_curves.watchtower_csv
+import datetime as datetime
+#from helper_functions import *
+
+from predictive_curves.helper_functions import *
+import sys
+sys.path.insert(0, '..')  # Now we would have access to the parent modules as well
+
+#os.chdir(os.path.dirname(os.getcwd()))
+from dallas_db_scripts.db_connector import DBHelper
+db = DBHelper()
+db.__connect__()
+
+# run_id=121
+test_model_time=0.7
+r_location=r"C:\Program Files\R\R-4.0.3\bin\Rscript.exe"
+home_location=os.path.dirname(os.getcwd())
+code_location=os.path.join(home_location,'predictive_curves')
+time = None
+section_id = None
+enrolment = None
+course = None
+predict_time = None
+
+
+#share with r process
+
+def default_year(ay):
+    ay_default="AY"+"_".join([str(int(i)-1) for i in ay.replace("AY","").split("_")])
+    return ay_default
+
+def percentile(n):
+    def percentile_(x):
+        return np.percentile(x, n)
+    percentile_.__name__ = 'percentile_%s' % n
+    return percentile_
+
+def convert_str(x):
+    try:
+        x=int(x)
+        return x
+    except:
+        return x
+    
+def dataprep_scoring(df_pred, ay, sem, model_time=1 ,day_lag=0):
+    SEMESTER_selected=[i for i in df_pred['SEMESTER'].unique() if sem.lower() in i.lower()]
+    SEMESTER_selected=pd.DataFrame(SEMESTER_selected)
+    SEMESTER_selected.columns=['SEMESTER']
+    
+    df=df_pred.copy()
+    df=df[df['ACADEMIC_YEAR']==ay]
+    df=df[df[time].astype(float)<200]
+    df=pd.merge(df,SEMESTER_selected,on='SEMESTER',how='inner')
+    df['INST_METHOD_CONSOLIDATED'].fillna('Other',inplace=True)
+    df['SEMESTER_USE']=df['SEMESTER']
+
+    
+    if 'summer' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course])[time].agg(percentile(97)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course],how='left')
+    elif 'may' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    elif 'FALL SEMESTER'.lower() in sem.lower():
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    else:
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')    
+    
+    
+    #### Data Manipulation to do the following:
+    #- Filter for filters provided in config file
+    #- Fill each section till last available sections date within a Course level
+    #- Group by at COLLEGE X Course X Modality X Session length level
+    #- Join back initial data
+    
+    
+    
+    dup=pd.DataFrame([i+1 for i in range(int(max(df[str(time)+'_x'])))])
+    dup.columns=[str(time)+"_x"]
+    dup['cjoin']=1
+    
+    section=pd.DataFrame([i for i in df[section_id].unique()])
+    section.columns=[section_id]
+    section['cjoin']=1
+    
+    dupXsection=pd.merge(dup,section,on='cjoin')
+    print(len(dupXsection))
+    # df['cjoin']=1
+    # dup
+    section_dup=pd.merge(dupXsection,df,how='left',on=[section_id,str(time)+"_x"])
+    # section_dup.head()
+    section_dup[[course, enrolment,str(time)+"_y"]] = section_dup[[course, enrolment,str(time)+"_y"]].fillna(section_dup.groupby([section_id])[[course, enrolment,str(time)+"_y"]].ffill())
+    section_dup=section_dup[[course,section_id,str(time)+"_x",str(time)+"_y",enrolment]].sort_values(by=[course,section_id])
+    
+    section_dup=pd.merge(section_dup,df[[course,section_id,str(time)+'_y']].drop_duplicates(),on=section_id)
+    del(section_dup[str(course)+'_x'])
+    del(section_dup[str(time)+'_y_x'])
+    # Set timely cutoffs for testing purposes
+    section_dup=section_dup[section_dup[str(time)+"_x"]<=section_dup[str(time)+"_y_y"]*model_time]
+    section_dup[enrolment].fillna(0,inplace=True)
+    section_dup.columns=[section_id,'time','enrolment','course','max_time']
+    
+    print(len(section_dup))
+    print(len(df_pred))
+    
+    #Subset the original columns that need to be in the dataset
+    joinback=df_pred[['ACADEMIC_YEAR', 'SEMESTER', 'COLLEGE', 'SAC_COURSE_NAME',
+           'INST_METHOD_CONSOLIDATED',
+            section_id]].drop_duplicates()
+    
+    print(len(joinback))
+    
+    section_dup=pd.merge(section_dup,joinback,on=section_id,how='left')
+    section_dup=section_dup.drop_duplicates()
+    len(section_dup)
+#    section_dup['SEMESTER_USE']=section_dup.apply(lambda x: x['SEMESTER'] if x['SEMESTER']!='FALL SEMESTER' else x['WEEK_BUCKET_FINAL'],axis=1)
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER']
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER_USE'].astype(str)
+    model_level=section_dup.groupby(['COLLEGE', 'SAC_COURSE_NAME','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE','time'])['enrolment'].sum().reset_index()
+    model_level['GROUP1']=model_level['COLLEGE'].map(str) +"_"+ model_level['SAC_COURSE_NAME'].map(str) +"_"+ model_level['INST_METHOD_CONSOLIDATED'].map(str) +"_"+ model_level['SEMESTER_USE'].map(str)
+    
+    model_level=model_level[['GROUP1','time','enrolment']]
+    model_level['FIL']=1
+    model_level.columns=['GROUP1','TIME','ENROLLMENT','FIL']
+    #Sample - Please remove later
+    return model_level
+
+    
+def dataprep(df_pred,ay,sem,model_time=1):
+    SEMESTER_selected=[i for i in df_pred['SEMESTER'].unique() if sem.lower() in i.lower()]
+    SEMESTER_selected=pd.DataFrame(SEMESTER_selected)
+    SEMESTER_selected.columns=['SEMESTER']
+        
+    df=df_pred.copy()
+    df=df[df['ACADEMIC_YEAR']==ay.replace('_','-')]
+    df=df[df[time].astype(float)<200]
+    df=pd.merge(df,SEMESTER_selected,on='SEMESTER',how='inner')
+    df['INST_METHOD_CONSOLIDATED'].fillna('Other',inplace=True)
+    
+    if 'summer' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course])[time].agg(percentile(97)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course],how='left')
+    elif 'may' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    elif 'FALL SEMESTER'.lower() in sem.lower():
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    else:
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')    
+    
+    
+    #### Data Manipulation to do the following:
+    #- Filter for filters provided in config file
+    #- Fill each section till last available sections date within a Course level
+    #- Group by at COLLEGE X Course X Modality X Session length level
+    #- Join back initial data
+    
+    
+    
+    dup=pd.DataFrame([i+1 for i in range(max(df[str(time)+'_x']))])
+    dup.columns=[str(time)+"_x"]
+    dup['cjoin']=1
+    
+    section=pd.DataFrame([i for i in df[section_id].unique()])
+    section.columns=[section_id]
+    section['cjoin']=1
+    
+    dupXsection=pd.merge(dup,section,on='cjoin')
+    print(len(dupXsection))
+    # df['cjoin']=1
+    # dup
+    section_dup=pd.merge(dupXsection,df,how='left',on=[section_id,str(time)+"_x"])
+    # section_dup.head()
+    section_dup[[course, enrolment,str(time)+"_y"]] = section_dup[[course, enrolment,str(time)+"_y"]].fillna(section_dup.groupby([section_id])[[course, enrolment,str(time)+"_y"]].ffill())
+    section_dup=section_dup[[course,section_id,str(time)+"_x",str(time)+"_y",enrolment]].sort_values(by=[course,section_id])
+    
+    section_dup=pd.merge(section_dup,df[[course,section_id,str(time)+'_y']].drop_duplicates(),on=section_id)
+    del(section_dup[str(course)+'_x'])
+    del(section_dup[str(time)+'_y_x'])
+    # Set timely cutoffs for testing purposes
+    section_dup=section_dup[section_dup[str(time)+"_x"]<=section_dup[str(time)+"_y_y"]*model_time]
+    section_dup[enrolment].fillna(0,inplace=True)
+    section_dup.columns=[section_id,'time','enrolment','course','max_time']
+    
+    print(len(section_dup))
+    print(len(df_pred))
+    
+    #Subset the original columns that need to be in the dataset
+    joinback=df_pred[['ACADEMIC_YEAR', 'SEMESTER', 'COLLEGE', 'SAC_COURSE_NAME',
+           'INST_METHOD_CONSOLIDATED',
+            section_id]].drop_duplicates()
+    
+    print(len(joinback))
+    
+    section_dup=pd.merge(section_dup,joinback,on=section_id,how='left')
+    section_dup=section_dup.drop_duplicates()
+    len(section_dup)
+#    section_dup['SEMESTER_USE']=section_dup.apply(lambda x: x['SEMESTER'] if x['SEMESTER']!='FALL SEMESTER' else x['WEEK_BUCKET_FINAL'],axis=1)
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER']
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER_USE'].astype(str)
+    model_level=section_dup.groupby(['COLLEGE', 'SAC_COURSE_NAME','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE','time'])['enrolment'].sum().reset_index()
+
+    model_level['GROUP1']=model_level['COLLEGE'].map(str) +"_"+ model_level['SAC_COURSE_NAME'].map(str) +"_"+ model_level['INST_METHOD_CONSOLIDATED'].map(str) +"_"+ model_level['SEMESTER_USE'].map(str)
+    model_level=model_level[['GROUP1','time','enrolment']]
+    model_level['FIL']=1
+    model_level.columns=['GROUP1','TIME','ENROLLMENT','FIL']
+    model_level['model_time']=model_time*10
+    #Sample - Please remove later
+    return model_level
+
+
+def bestfit(df,bestfit):
+    findbest=df.groupby('GROUP1')['TIME'].max().reset_index()
+    findbest=pd.merge(findbest,bestfit,on='GROUP1',how='left')
+    findbest['closest']=abs(findbest['TIME']-findbest['DAYS_PASSED'])
+    findbest=pd.merge(findbest,findbest.groupby(['GROUP1'])['closest'].min().reset_index(),on='GROUP1',how='left')
+#    findbest=findbest[findbest['closest_x']==findbest['closest_y']][['GROUP1','MODEL_ID','BESTFIT','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']].drop_duplicates(['GROUP1'])
+    findbest=findbest[(findbest['closest_x']==findbest['closest_y']) | (findbest['closest_x'].isna() & findbest['closest_y'].isna())][['GROUP1','MODEL_ID','BESTFIT','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']].drop_duplicates(['GROUP1'])
+    return findbest
+    
+def bestfit(df,bestfit):
+    findbest=df.groupby('GROUP1')['TIME'].max().reset_index()
+    findbest=pd.merge(findbest,bestfit,on='GROUP1',how='left')
+    findbest['closest']=abs(findbest['TIME']-findbest['DAYS_PASSED'])
+    findbest=pd.merge(findbest,findbest.groupby(['GROUP1'])['closest'].min().reset_index(),on='GROUP1',how='left')
+#    findbest=findbest[findbest['closest_x']==findbest['closest_y']][['GROUP1','MODEL_ID','BESTFIT','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']].drop_duplicates(['GROUP1'])
+    findbest=findbest[(findbest['closest_x']==findbest['closest_y']) | (findbest['closest_x'].isna() & findbest['closest_y'].isna())][['GROUP1','MODEL_ID','BESTFIT','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']].drop_duplicates(['GROUP1'])
+    return findbest
+
+def getaccuracy(summary):
+    sumdefault=summary.copy()
+    sumdefault=sumdefault[['GROUP1','DAYS_PASSED','MODEL_ID','ENROLLMENT','TYPE','PREDICTION']]
+    sumdefault=sumdefault.drop_duplicates(['GROUP1','DAYS_PASSED','MODEL_ID','ENROLLMENT','TYPE'])
+    sumdefault=sumdefault.set_index(['GROUP1','DAYS_PASSED','MODEL_ID','ENROLLMENT','TYPE']).unstack(level=-1).reset_index()
+    # sumdefault.head()
+    types=summary['TYPE'].unique()
+    types.sort()
+    
+    sumdefault.columns=[*['GROUP1','DAYS_PASSED','MODEL_ID', 'ENROLLMENT'],*types]
+    sumdefault.head()
+    
+    for i in [*types]:
+        sumdefault[i+"_ERROR"]=abs(sumdefault[i]/sumdefault['ENROLLMENT']-1)
+        sumdefault[i+'_SUMPRODUCT']=sumdefault[i+'_ERROR']*sumdefault['ENROLLMENT']
+    
+    sumdefault['BESTFIT']=sumdefault[[i+"_SUMPRODUCT" for i in types]].idxmin(axis=1)
+    sumdefault.head()
+    
+    sumdefault['BESTFIT_ERROR']=sumdefault[[i+"_ERROR" for i in types]].apply(np.nanmin,axis=1)
+    sumdefault['BESTFIT_SUMPRODUCT']=sumdefault[[i+"_SUMPRODUCT" for i in types]].apply(np.nanmin,axis=1)
+    sumdefault['BESTFIT']=sumdefault['BESTFIT'].str.replace("_SUMPRODUCT","")
+    sumdefault['ENROLLMENT_GROUP1']=sumdefault.apply(lambda x: (((x['ENROLLMENT']>300 and ("greater than 300",) or ((x['ENROLLMENT']>100 and ("101-300",) or ((x['ENROLLMENT']>25 and ("26-100",) or ("less than 25",))[0],))[0],))[0],))[0],axis=1)
+    print(len(sumdefault[['GROUP1','MODEL_ID','BESTFIT']]))
+    print(len(sumdefault[['GROUP1','MODEL_ID','BESTFIT']].drop_duplicates()))
+    print(len(sumdefault.drop_duplicates(subset=['GROUP1','MODEL_ID'])))
+    sumdefault=sumdefault[[*['GROUP1','DAYS_PASSED','MODEL_ID','BESTFIT','BESTFIT_ERROR','ENROLLMENT_GROUP1','ENROLLMENT'],*types]]
+    sumdefault.columns=[*['GROUP1','DAYS_PASSED','MODEL_ID','BESTFIT','BESTFIT_ERROR','ENROLLMENT_GROUP1','OVERALL_ENROLLMENT'],*types]
+    sumdefault.head()
+    return sumdefault
+    
+def bestfits(ay,ay_default,sem,run_id):
+    powerbi_input=pd.read_sql("{}_{}_powerBI_output".format(ay,sem),db.conn)
+    summary_input=pd.read_sql("{}_{}_modelSummary_output".format(ay,sem),db.conn)
+    
+    accuracy=getaccuracy(summary_input)
+    print(len(powerbi_input))
+    powerbi_input=pd.merge(powerbi_input,accuracy,on=['GROUP1','MODEL_ID'],how='left')
+    print(len(powerbi_input.drop_duplicates()))
+    
+    powerbi_input=powerbi_input[['GROUP1', 'MODEL', 'DAYS_PASSED_x', 'MODEL_ID', 'TIME', 'ENROLLMENT',
+       'PREDICTION', 'TYPE', 'BESTFIT', 'BESTFIT_ERROR',
+       'ENROLLMENT_GROUP1', 'OVERALL_ENROLLMENT']]
+    powerbi_input.columns=['GROUP1', 'MODEL', 'DAYS_PASSED', 'MODEL_ID', 'TIME', 'ENROLLMENT',
+           'PREDICTION', 'TYPE', 'BESTFIT', 'BESTFIT_ERROR',
+           'ENROLLMENT_GROUP1', 'OVERALL_ENROLLMENT']
+        
+    pbi=powerbi_input.copy()
+    pbi['trim_status']='Trimmed'
+    pbi['term']=sem
+    pbi['year_status']=ay.replace("_","-")
+    pbi=pbi[pbi['TYPE']==pbi['BESTFIT']]
+    pbi_m8=pbi[pbi['MODEL_ID']=='MODEL 1']
+    powerbiinputl3=pd.merge(pbi_m8,pbi_m8.groupby(['GROUP1','term','year_status'])['TIME'].max().reset_index(),on=['GROUP1','term','year_status','TIME'],how='inner')
+
+#    pbi.to_sql("powerbi_research_{}_{}".format(ay,sem),db.conn,if_exists='replace')
+    pbi['run_id']=run_id
+    pbi.to_sql('research_curves',db.conn,if_exists='append')
+    powerbiinputl3.to_sql("powerbi_bestfit_model8_{}_{}".format(ay,sem),db.conn, if_exists='replace')
+    accuracy=accuracy.replace([np.inf, -np.inf], np.nan)
+    accuracy = accuracy.astype(object).where(pd.notnull(accuracy), None)
+    # for i in  range(len(accuracy)):
+    #     print(i)
+    #     a=accuracy[i:i+1]
+    #     a=accuracy[2606:2607]
+    #     a.to_sql("bestfit_{}_{}".format(ay,sem),db.conn,if_exists='replace')
+    accuracy.to_sql("bestfit_{}_{}".format(ay,sem),db.conn,if_exists='replace')
+
+
+
+
+def bestfit_diagnosis(df,bestfit):
+    import pandas as pd
+    print('bestfit1')
+    findbest=df.groupby('GROUP1')['TIME'].max().reset_index()
+    print('bestfit2')
+    findbest=pd.merge(findbest,bestfit,on='GROUP1',how='left')
+    print('bestfit3')
+    findbest['closest']=abs(findbest['TIME']-findbest['DAYS_PASSED'])
+    findbest=pd.merge(findbest,findbest.groupby(['GROUP1'])['closest'].min().reset_index(),on='GROUP1',how='left')
+    findbest=findbest[(findbest['closest_x']==findbest['closest_y']) | (findbest['closest_x'].isna() & findbest['closest_y'].isna())][['GROUP1','MODEL_ID','BESTFIT','BESTFIT_ERROR','OVERALL_ENROLLMENT']].drop_duplicates(['GROUP1'])
+    return findbest
+
+def min_max_correction(scored,model_level_append,start_trim,predict_time,ay,ay_default,sem,db):
+    scored=pd.read_sql("scored_models_{}_{}".format(ay,sem),db.conn)
+    default=pd.read_sql("autotest_{}_{}".format(ay_default,sem),db.conn)
+    default.rename(columns={'ENROLLMENT':'DEFAULT_ENROLLMENT'},inplace='True')
+    
+    default=default.merge(default.groupby(['GROUP1'])['TIME'].max().reset_index().rename(columns={'TIME':'MAX_TIME'}),on=['GROUP1'],how='left')
+    last_year=default[default['TIME']==default['MAX_TIME']][['GROUP1','DEFAULT_ENROLLMENT']]
+    last_year.columns=['GROUP1','LY_ENROLLMENT']
+    default=default.merge(last_year,on=['GROUP1'],how='left')
+    
+    if len(model_level_append)>0:
+        scored['TIME']=scored['TIME']+start_trim
+    scored_merge=scored.merge(scored.groupby('GROUP1')['TIME'].min().reset_index().rename(columns={'TIME':'min_time'}),on=['GROUP1'],how='left')
+    scored_merge=scored_merge[scored_merge['TIME']==scored_merge['min_time']]
+    model_level_append=model_level_append[['GROUP1','TIME','ENROLLMENT']]
+    
+    
+    # model_level_append=model_level_append.merge(scored_merge[['GROUP1','PROJECTION_2018','TYPE_2018','PROJECTION_2019',
+    #    'TYPE_2019', 'ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+    #    'DEFAULT_ERROR_2019', 'SESSION']], on=['GROUP1'], how='left')
+    model_level_append=model_level_append.merge(scored_merge[['GROUP1','PROJECTION_2019',
+        'TYPE_2019', 'ERROR_2019', 'SESSION']], on=['GROUP1'], how='left')
+    scored=pd.concat([model_level_append,scored]).sort_values(['GROUP1','TIME'])
+
+    registration_period=pd.read_csv(os.path.join(home_location,"predictive_curves", "registration_period.csv"))
+    registration_period['registration_end']=registration_period['registration_end'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['registration_start']=registration_period['registration_start'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['predict_time']=registration_period.apply(lambda x: (x['registration_end']-x['registration_start']).days, axis=1)
+    
+    all_groups=pd.concat([scored[['GROUP1','TIME']],default[['GROUP1','TIME']]]).drop_duplicates()
+    all_groups['Semester']=all_groups['GROUP1'].apply(lambda x: x.split('_')[3])
+    all_groups=all_groups.merge(registration_period[['Semester','predict_time']], how='left')
+
+    all_groups=all_groups[all_groups['TIME']<all_groups['predict_time']]
+    
+    scored_all=pd.merge(all_groups,scored,on=['GROUP1','TIME'],how='left')
+    
+    scored_all=pd.merge(scored_all,default, on=['GROUP1','TIME'],how='left')
+    
+    scored_all['term']=sem
+    scored_all['SESSION']=sem.upper()
+    scored_all['year_status']=ay
+    
+    scored_all.columns
+    
+    
+    max_actual_time=scored_all[scored_all['ENROLLMENT'].notna()].groupby('GROUP1')['TIME'].max().reset_index().rename(columns={'TIME':'max_actual_time'})
+    min_pred_time=scored_all[scored_all['ENROLLMENT'].isna()].groupby('GROUP1')['TIME'].min().reset_index().rename(columns={'TIME':'min_pred_time'})
+    max_pred_time=scored_all[scored_all['ENROLLMENT'].isna()].groupby('GROUP1')['TIME'].max().reset_index().rename(columns={'TIME':'max_pred_time'})
+    
+    scored_all=scored_all.merge(max_actual_time,on='GROUP1',how='left').merge(min_pred_time,on='GROUP1',how='left').merge(max_pred_time,on='GROUP1',how='left')
+    
+    max_actual=scored_all[scored_all['TIME']==scored_all['max_actual_time']][['GROUP1','ENROLLMENT']]
+    max_actual.columns=['GROUP1','max_actual']
+    min_pred=scored_all[scored_all['TIME']==scored_all['min_pred_time']][['GROUP1','PROJECTION_2019']]
+    min_pred.columns=['GROUP1','min_pred_2019']
+    max_pred=scored_all[scored_all['TIME']==scored_all['max_pred_time']][['GROUP1','PROJECTION_2019']]
+    max_pred.columns=['GROUP1','max_pred_2019']
+    
+    scored_all=scored_all.merge(max_actual,on='GROUP1',how='left').merge(min_pred,on='GROUP1',how='left').merge(max_pred,on='GROUP1',how='left')
+    
+    scored_all['max_pred_2019_test']=scored_all.apply(lambda x: (x['max_pred_2019']<0.5*x['LY_ENROLLMENT'] and 0.5*x['LY_ENROLLMENT']) or (x['max_pred_2019']>1.5*x['LY_ENROLLMENT'] and 1.5*x['LY_ENROLLMENT']) or x['max_pred_2019'],axis=1)
+    scored_all['max_pred_2019_test']=scored_all.apply(lambda x: (x['max_pred_2019']<x['max_actual'] and x['max_actual']) or (x['max_pred_2019']),axis=1)
+    # scored_all['max_pred_2018_test']=scored_all.apply(lambda x: (x['max_pred_2018']<0.5*x['LY_ENROLLMENT'] and 0.5*x['LY_ENROLLMENT']) or (x['max_pred_2018']>1.5*x['LY_ENROLLMENT'] and 1.5*x['LY_ENROLLMENT']) or x['max_pred_2018'],axis=1)
+    scored_all['adjusted_projection_2019']=scored_all['max_actual']+((scored_all['max_pred_2019_test']-scored_all['max_actual'])*(scored_all['PROJECTION_2019']-scored_all['min_pred_2019'])/(scored_all['max_pred_2019']-scored_all['min_pred_2019']))
+    
+    # scored_all['adjusted_projection_2019']=scored_all['max_actual']+((scored_all['max_pred_2019']-scored_all['max_actual'])*(scored_all['PROJECTION_2019']-scored_all['min_pred_2019'])/(scored_all['max_pred_2019']-scored_all['min_pred_2019']))
+    # scored_all['adjusted_projection_2018']=scored_all['max_actual']+((scored_all['max_pred_2018']-scored_all['max_actual'])*(scored_all['PROJECTION_2018']-scored_all['min_pred_2018'])/(scored_all['max_pred_2018']-scored_all['min_pred_2018']))
+    scored_all=scored_all[['GROUP1', 'TIME',
+           'adjusted_projection_2019', 'TYPE_2019', 'ERROR_2019', 'ENROLLMENT', 'SESSION', 'DEFAULT_ENROLLMENT',
+           'term', 'year_status']]
+    
+    scored_all.columns=['GROUP1', 'TIME', 
+           'PROJECTION_2019', 'TYPE_2019', 
+           'ERROR_2019', 'ENROLLMENT', 'SESSION', 'ROLLOVER',
+           'term', 'year_status']
+    return scored_all
+
+def run_method1(df_pred,ay,sem, start_trim):
+    ay=ay.replace("-","_")
+    ay_default=default_year(ay)
+    ay_default2=default_year(ay_default)
+    # Output the information to table for r
+    registration_period=pd.read_csv(os.path.join(home_location,"predictive_curves", "registration_period.csv"))
+    registration_period['registration_end']=registration_period['registration_end'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['registration_start']=registration_period['registration_start'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['predict_time']=registration_period.apply(lambda x: (x['registration_end']-x['registration_start']).days, axis=1)
+
+    max_time_for_sem=registration_period[registration_period['Semester'].str.contains(sem.upper())]['predict_time'].max()
+    d2=pd.DataFrame({'Variable': ['sem', 'ay','ay_default','predict_upto'], 'value': [sem, ay,ay_default,max_time_for_sem]})
+    d2.to_sql('r_config_scoring',db.conn, if_exists='replace')
+    
+    #Divide the SEMESTERs - Might remove if the data has no cleanliness issues
+    #df_pred=pd.read_sql_query("SELECT * FROM Distribution_Data_CF where ACADEMIC_YEAR = '{}' and SEMESTER LIKE '%{}%'".format(ay.replace("_","-"),sem), db.conn)
+
+    df_pred['SEMESTER_USE']=df_pred['SEMESTER']
+    df_pred['SEMESTER_USE']=df_pred['SEMESTER_USE'].astype(str)
+    df_pred=df_pred[df_pred['DAYS_AFTER_REG_START']!='DAYS_AFTER_REG_START']
+    df_pred=df_pred[df_pred['DAYS_AFTER_REG_START']!='--------------------']
+    df_pred['DAYS_AFTER_REG_START']=df_pred['DAYS_AFTER_REG_START'].astype(float).astype(int)
+    df_pred['ENROLLMENT_COUNT']=df_pred['ENROLLMENT_COUNT'].astype(float).astype(int)
+    df_pred['SECTION_ID']=df_pred['SECTION_ID'].astype(int)
+    
+    # Get the highest possible time for each group.
+    model_level=dataprep_scoring(df_pred,ay.replace("_","-"),sem,test_model_time)
+    model_level=model_level.merge(model_level.groupby('GROUP1')['TIME'].max().reset_index().rename(columns={'TIME':'max_time'}))
+    model_level.to_sql(r'autotest_{}_{}'.format(ay,sem),db.conn,if_exists='replace')
+    
+    # Find the best fits for the past 2 years
+    bestfit_default2=pd.read_sql("bestfit_{}_{}".format(ay_default2,sem),db.conn)
+    bestfit_default=pd.read_sql("bestfit_{}_{}".format(ay_default,sem),db.conn)
+    
+    # If using fall, trim it 
+    # Need to double check the methodology here
+    if sem.lower()=='fall':
+        bestfit_default2['DAYS_PASSED']=bestfit_default2['DAYS_PASSED']
+        bestfit_default['DAYS_PASSED']=bestfit_default['DAYS_PASSED']
+    else:
+        pass
+    
+    
+    
+    bf_default2=bestfit(model_level,bestfit_default2)[['GROUP1','BESTFIT','MODEL_ID','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']]
+    bf_default2.columns=['GROUP1','BEST_FIT_{}'.format('2018'),'MODEL_{}'.format('2018'),'ERROR_{}'.format('2018'),'ENROLLMENT_{}'.format('2018'),'DEFAULT_ERROR_{}'.format('2018')]
+    bf_default2.head()
+    
+    bf_default=bestfit(model_level,bestfit_default)[['GROUP1','BESTFIT','MODEL_ID','BESTFIT_ERROR','OVERALL_ENROLLMENT','DEFAULT_ERROR']]
+    bf_default.columns=['GROUP1','BEST_FIT_{}'.format('2019'),'MODEL_{}'.format('2019'),'ERROR_{}'.format('2019'),'ENROLLMENT_{}'.format('2019'),'DEFAULT_ERROR_{}'.format('2019')]
+    bf_default.head()
+    
+    # Find the best fitting curve for both the years, last year and the year before. 
+    # Output the information to a table
+    pd.merge(bf_default2,bf_default,on='GROUP1',how='outer').to_sql(os.path.join(r'closest_fit_{}_{}'.format(ay_default,sem)), db.conn, if_exists='replace')
+    
+    # Trim models in fall
+    # model_level_backup=model_level.copy()
+#    model_level['TIME_TRIM']=model_level.apply(lambda x: x['TIME']-60 if x['max_time']>60+10 else x['TIME'],axis=1)
+    model_level['TIME_TRIM']=model_level['TIME']
+    model_level_append=model_level[model_level['TIME_TRIM']<=0]
+    model_level=model_level[model_level['TIME_TRIM']>0]
+    model_level['TIME']=model_level['TIME_TRIM']
+
+    model_level.to_sql("autotest_{}_{}".format(ay,sem),db.conn, if_exists='replace')
+    
+    # Run the R code for scoring
+    
+    proc = subprocess.Popen([r_location,"master_scoring_code.R"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.path.join(code_location))
+    stdout, stderr = proc.communicate()
+    print(stdout,stderr)    
+    
+    # Get the default values
+    scored=pd.read_sql("scored_models_{}_{}".format(ay,sem),db.conn)
+    scored=min_max_correction(scored,model_level_append,start_trim,predict_time,ay,ay_default,sem,db)
+#    default=pd.read_sql("autotest_{}_{}".format(ay_default,sem),db.conn)
+#    if len(model_level_append)>0:
+#        scored['TIME']=scored['TIME']+start_trim
+#    scored_merge=scored.merge(scored.groupby('GROUP1')['TIME'].min().reset_index().rename(columns={'TIME':'min_time'}),on=['GROUP1'],how='left')
+#    scored_merge=scored_merge[scored_merge['TIME']==scored_merge['min_time']]
+#    model_level_append=model_level_append[['GROUP1','TIME','ENROLLMENT']]
+#    
+#    
+#    model_level_append=model_level_append.merge(scored_merge[['GROUP1','PROJECTION_2018','TYPE_2018','PROJECTION_2019',
+#       'TYPE_2019', 'ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#       'DEFAULT_ERROR_2019', 'SESSION']], on=['GROUP1'], how='left')
+#    scored=pd.concat([model_level_append,scored]).sort_values(['GROUP1','TIME'])
+#    
+#    all_groups=pd.concat([scored[['GROUP1','TIME']],default[['GROUP1','TIME']]]).drop_duplicates()
+#    all_groups=all_groups[all_groups['TIME']<predict_time]
+#    
+#    scored_all=pd.merge(all_groups,scored,on=['GROUP1','TIME'],how='left')
+#    
+#    scored_all=pd.merge(scored_all,default, on=['GROUP1','TIME'],how='left')
+#    
+#    scored_all['term']=sem
+#    scored_all['SESSION']=sem.upper()
+#    scored_all['year_status']=ay
+#    
+#    scored_all.columns
+#    scored_all=scored_all[['GROUP1', 'TIME', 'PROJECTION_2018', 'TYPE_2018', 'PROJECTION_2019',
+#           'TYPE_2019','ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#           'DEFAULT_ERROR_2019', 'ENROLLMENT_x', 'SESSION', 'ENROLLMENT_y', 'term',
+#           'year_status']]
+#    scored_all.columns=['GROUP1', 'TIME', 'PROJECTION_2018', 'TYPE_2018', 'PROJECTION_2019',
+#           'TYPE_2019','ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#           'DEFAULT_ERROR_2019', 'ENROLLMENT', 'SESSION', 'ROLLOVER', 'term',
+#           'year_status']
+    return scored
+    
+
+def run_method3(df_pred,ay,sem,home_location,gompertz,weibull,linear,logrithmic,loglogit,negexp,start_trim,end_trim,run_id):
+    ######################################################################
+    # Find the year and the year before
+    ######################################################################
+    
+    #Customize
+    ay_default=default_year(ay)
+#    ay_default2=helper_functions.default_year(ay_default)
+    
+    ######################################################################
+    # Run first iteration of the code (When the scored file doesn't exist)
+    ######################################################################
+#    actual_data=model_level=data_prep(df_pred,ay,sem,1)
+    # Prepare data for a particular year and semester
+    model_level=dataprep_scoring(df_pred,ay.replace("_","-"),sem,test_model_time)
+    model_level=model_level.merge(model_level.groupby('GROUP1')['TIME'].max().reset_index().rename(columns={'TIME':'max_time'}))
+    model_level.to_sql(r'autotest_{}_{}'.format(ay,sem),db.conn,if_exists='replace')
+
+    d1=pd.DataFrame({'Variable': ['sem', 'ay','path','gompertz','weibull','linear','logrithmic','loglogit','negexp','start_trim','end_trim'], 'value': [sem, ay,home_location,gompertz,weibull,linear,logrithmic,loglogit,negexp,start_trim,end_trim]})
+    d1.to_sql('r_config',db.conn,if_exists='replace')
+    
+    proc = subprocess.Popen([r_location,"master_code - diagnosis.R"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.path.join(code_location))
+    stdout, stderr = proc.communicate()
+    print(stderr)
+    
+    bestfits(ay,ay_default,sem,run_id)
+    
+#    d2=pd.DataFrame({'Variable': ['sem', 'ay','ay_default','predict_upto'], 'value': [sem, ay,ay_default,predict_time]})
+#    d2.to_sql('r_config_scoring',index=False)
+    
+    bestfit_default=pd.read_sql("bestfit_{}_{}".format(ay,sem),db.conn)
+    
+    bestfit_default['DAYS_PASSED']=bestfit_default['DAYS_PASSED']
+    
+    if start_trim > 0:
+        bestfit_default['DAYS_PASSED']=bestfit_default['DAYS_PASSED']+start_trim
+    else:
+        pass
+    
+    bf_default=bestfit_diagnosis(model_level,bestfit_default)[['GROUP1','BESTFIT','MODEL_ID','BESTFIT_ERROR','OVERALL_ENROLLMENT']]
+    bf_default.columns=['GROUP1','BEST_FIT_{}'.format('2019'),'MODEL_{}'.format('2019'),'ERROR_{}'.format('2019'),'ENROLLMENT_{}'.format('2019')]
+    bf_default.head()
+    
+    bf_default.to_sql(r'closest_fit_{}_{}'.format(ay,sem),db.conn, if_exists='replace')
+    
+    model_level['TIME_TRIM']=model_level.apply(lambda x: x['TIME']-start_trim if x['max_time']>start_trim+10 else x['TIME'],axis=1)
+    model_level_append=model_level[model_level['TIME_TRIM']<=0]
+    model_level=model_level[model_level['TIME_TRIM']>0]
+    model_level['TIME']=model_level['TIME_TRIM']
+    model_level.to_sql('autotest_{}_{}'.format(ay,sem),db.conn,if_exists='replace')
+    
+    proc = subprocess.Popen([r_location,"master_scoring_code-diagnosis.R"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.path.join(code_location))
+    stdout, stderr = proc.communicate()
+    print(stdout,stderr)
+    scored=pd.read_sql("scored_models_{}_{}".format(ay.replace('-','_'),sem),db.conn)
+    
+    scored=min_max_correction(scored,model_level_append,start_trim,predict_time,ay,ay_default,sem,db)
+#    default=pd.read_sql("autotest_{}_{}".format(ay_default,sem),db.conn)
+#    if len(model_level_append)>0:
+#        scored['TIME']=scored['TIME']+start_trim
+#    scored_merge=scored.merge(scored.groupby('GROUP1')['TIME'].min().reset_index().rename(columns={'TIME':'min_time'}),on=['GROUP1'],how='left')
+#    scored_merge=scored_merge[scored_merge['TIME']==scored_merge['min_time']]
+#    model_level_append=model_level_append[['GROUP1','TIME','ENROLLMENT']]
+#    
+#    
+#    model_level_append=model_level_append.merge(scored_merge[['GROUP1','PROJECTION_2018','TYPE_2018','PROJECTION_2019',
+#       'TYPE_2019', 'ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#       'DEFAULT_ERROR_2019', 'SESSION']], on=['GROUP1'], how='left')
+#    scored=pd.concat([model_level_append,scored]).sort_values(['GROUP1','TIME'])
+#    
+#    all_groups=pd.concat([scored[['GROUP1','TIME']],default[['GROUP1','TIME']]]).drop_duplicates()
+#    all_groups=all_groups[all_groups['TIME']<predict_time]
+#    
+#    scored_all=pd.merge(all_groups,scored,on=['GROUP1','TIME'],how='left')
+#    
+#    scored_all=pd.merge(scored_all,default, on=['GROUP1','TIME'],how='left')
+#    
+#    scored_all['term']=sem
+#    scored_all['SESSION']=sem.upper()
+#    scored_all['year_status']=ay
+#    
+#    scored_all.columns
+#    scored_all=scored_all[['GROUP1', 'TIME', 'PROJECTION_2018', 'TYPE_2018', 'PROJECTION_2019',
+#           'TYPE_2019','ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#           'DEFAULT_ERROR_2019', 'ENROLLMENT_x', 'SESSION', 'ENROLLMENT_y', 'term',
+#           'year_status']]
+#    scored_all.columns=['GROUP1', 'TIME', 'PROJECTION_2018', 'TYPE_2018', 'PROJECTION_2019',
+#           'TYPE_2019','ERROR_2018', 'DEFAULT_ERROR_2018', 'ERROR_2019',
+#           'DEFAULT_ERROR_2019', 'ENROLLMENT', 'SESSION', 'ROLLOVER', 'term',
+#           'year_status']
+#    
+#    
+#    if len(model_level_append)>0:
+#        scored['TIME']=scored['TIME']+start_trim
+#    scored_merge=scored.merge(scored.groupby('GROUP1')['TIME'].min().reset_index().rename(columns={'TIME':'min_time'}),on=['GROUP1'],how='left')
+#    scored_merge=scored_merge[scored_merge['TIME']==scored_merge['min_time']]
+#    model_level_append=model_level_append[['GROUP1','TIME','ENROLLMENT']]
+    return scored
+
+def run_scoring(data_json,run_id):
+    # data_json['sql_params']['CURR_FALL8WK_END']
+    # data_json['sql_params']['CURR_SPRING8WK_END']
+    
+    # data_json['CURR_FALL_II_8WK_END']
+    # data_json['CURR_SPRING_II_8WK_END']
+
+    # Set years
+    global time, section_id, enrolment, course, predict_time
+    home_location=os.path.dirname(os.getcwd())
+    ay= data_json['scoring_ay']
+    sem = data_json['sem']
+    course= data_json['course']
+    time= data_json['time']
+    section_id= data_json['section_id']
+    enrolment= data_json['enrolment']
+    predict_time= data_json['predict_time']
+    start_trim= data_json['start_trim']
+    end_trim= data_json['end_trim']
+    gompertz= data_json['gompertz']
+    weibull= data_json['weibull']
+    linear= data_json['linear']
+    logrithmic= data_json['logrithmic']
+    loglogit= data_json['loglogit']
+    negexp= data_json['negexp']
+    f = open("setpath.R", "w")
+    f.write("path<-{}".format("'"+str(os.path.join(home_location, 'predictive_curves')).replace('\\','//')+"'"))
+    f.close()
+				 
+    ay=ay.replace("-","_")
+    ay_default=predictive_curves.helper_functions.default(ay)
+    ay_default2=predictive_curves.helper_functions.default(ay_default)
+    registration_period=pd.read_csv(os.path.join(home_location,"predictive_curves", "registration_period.csv"))
+    registration_period['registration_end']=registration_period['registration_end'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['registration_start']=registration_period['registration_start'].apply(lambda x: datetime.datetime.strptime(x,"%m/%d/%Y"))
+    registration_period['predict_time']=registration_period.apply(lambda x: (x['registration_end']-x['registration_start']).days, axis=1)
+
+    max_time_for_sem=registration_period[registration_period['Semester'].str.contains(sem.upper())]['predict_time'].max()
+    d2=pd.DataFrame({'Variable': ['sem', 'ay','ay_default','predict_upto'], 'value': [sem, ay,ay_default,str(max_time_for_sem)]})
+    d2.to_sql('r_config_scoring',db.conn, if_exists='replace')
+    
+    try:
+        df_pred=pd.read_sql_query("SELECT * FROM Distribution_Data_CF where ACADEMIC_YEAR = '{}' and SEMESTER LIKE '%{}%'".format(ay.replace("_","-"),sem), db.conn)
+        # df_pred=pd.read_sql_query("SELECT * FROM Distribution_Data_CF where ACADEMIC_YEAR = '{}' and SEMESTER LIKE '%{}%' AND SAC_COURSE_NAME='ACCT-2301'".format(ay.replace("_","-"),sem), db.conn)
+        df_pred=df_pred[df_pred['SEMESTER'].notna()]
+    except:
+        print('Please run the SQL queries')
+    if df_pred['DAYS_AFTER_REG_START'].max()<(predict_time/2):
+        scored=run_method1(df_pred,ay,sem, start_trim)
+    else:
+        scored=run_method3(df_pred,ay,sem,home_location,gompertz,weibull,linear,logrithmic,loglogit,negexp,start_trim,end_trim, run_id)
+    scored['run_id']=run_id
+#    scored.to_sql('Scored_PowerBI_minmax_{}_{}'.format(ay.replace('-','_'),sem),db.conn, if_exists='append')
+    capacity=pd.read_sql("""SELECT concat(college,'_', course_name,'_', Inst_Method_consolidate,'_', semester) as GROUP1,
+	   COLLEGE,
+	   course_name,
+	   semester,
+	   Inst_Method_consolidate,
+	   SUM(ORIGINAL_CAPACITY) AS IDEAL_CAPACITY,
+	   SUM(FINAL_CAPACITY) AS ACTUAL_CAPACITY,
+	   SUM(ORIGINAL_CAPACITY) * 1.49 AS MAX_CAPACITY
+        FROM COURSES_DATA_CLEANED
+        WHERE IS_OFF_CAMPUS = '0' AND
+        	  Flag_Cancelled_Section = '0' AND
+        	  To_Remove = 'No' AND academic_year = '{}'
+        GROUP BY COLLEGE,
+	   course_name,
+	   semester,
+	   Inst_Method_consolidate""".format(ay.replace("_","-")), db.conn)
+    
+    capacity=capacity.drop_duplicates('GROUP1')
+    scored=scored.merge(capacity,on='GROUP1',how='left')
+    scored['GROUP']=scored['GROUP1'].str.replace("_","")
+    scored=scored[[ 'GROUP1', 'TIME', 'PROJECTION_2019', 'TYPE_2019', 'ERROR_2019',
+           'ENROLLMENT', 'SESSION', 'ROLLOVER', 'term', 'year_status', 'run_id',
+           'IDEAL_CAPACITY', 'ACTUAL_CAPACITY', 'MAX_CAPACITY', 'GROUP']]
+    scored.to_sql('predictive_enrollments',db.conn, if_exists='append')
+    predictive_curves.fillrate.run_fill_rate(sem,ay,run_id, test_model_time)
+    predictive_curves.watchtower_csv.watchtower_dataprep(ay,ay_default,sem, run_id)
+            
+        
+    
+if __name__=="__main__":
+    config='config'
+    
+    print(" Entering scoring process")
+    with open("predictive_curves\\{}.yaml".format(config), 'r') as stream:
+        try:
+            config=(yaml.safe_load(stream))
+        except yaml.YAMLError as exc:
+            print(exc)
+    
+    
+    
+	
+    ######################################################################
+    # Read variables from the config file:
+    # Read the required parameters from the cofing file
+    # Sets up column names
+    #################################################################e#####
+    ay=config['scoring_ay']
+    sem = config['sem']
+    course='SAC_COURSE_NAME'
+    time='DAYS_AFTER_REG_START'
+    section_id='SECTION_ID'
+    enrolment='ENROLLMENT_COUNT'
+    predict_time=config['predict_time']
+    start_trim=config['start_trim']
+    end_trim=config['end_trim']
+    gompertz=1
+    weibull=1
+    linear=1
+    logrithmic=1
+    loglogit=1
+    negexp=1
+    
+    
+    
