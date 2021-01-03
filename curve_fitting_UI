@@ -1,0 +1,309 @@
+import sys
+sys.path.insert(0, '..')  # Now we would have access to the parent modules as well
+
+
+import pandas as pd
+import os
+import subprocess
+import yaml
+import numpy as np
+from yaml import load, dump
+from predictive_curves.helper_functions import *
+#from predictive_curves.init import *
+from dallas_db_scripts.db_connector import DBHelper
+
+db = DBHelper()
+db.__connect__()
+run_id=121
+r_location=r'C:\Program Files\R\R-4.0.3\bin'
+home_location=os.path.dirname(os.getcwd())
+
+#share with r process
+
+def default(ay):
+    ay_default="AY"+"_".join([str(int(i)-1) for i in ay.replace("AY","").split("_")])
+    return ay_default
+
+def percentile(n):
+    def percentile_(x):
+        return np.percentile(x, n)
+    percentile_.__name__ = 'percentile_%s' % n
+    return percentile_
+
+def convert_str(x):
+    try:
+        x=int(x)
+        return x
+    except:
+        return x
+
+def curve_fits(df_orig, ay, sem, time, course,section_id,enrolment,home_location,run_id,start_trim=0,end_trim=0):
+    print('-------> Reached step 1')
+    # Select the semesters for which analysis has to be run
+    semester_selected=[i for i in df_orig['SEMESTER'].unique() if sem.lower() in i.lower()]
+    semester_selected=pd.DataFrame(semester_selected)
+    semester_selected.columns=['SEMESTER']
+    print('-------> Reached step 2')
+
+    df=df_orig.copy()
+    df=df[df['ACADEMIC_YEAR']==ay.replace("_","-")]
+    df=df[df[time].astype(float)<200]
+    df=pd.merge(df,semester_selected,on='SEMESTER',how='inner')
+    df['INST_METHOD_CONSOLIDATED'].fillna('Other',inplace=True)
+    print('-------> Reached step 3')
+    #Divide the semesters
+    df['SEMESTER_USE']=df['SEMESTER']
+    df['SEMESTER_USE']=df['SEMESTER_USE'].astype(str)
+    print('-------> Reached step 4')
+    df[time]=df[time].astype(float).astype(int)
+    df['SECTION_ID']=df['SECTION_ID'].astype(int)
+
+
+
+    if 'summer' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course])[time].agg(percentile(95)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE',course],how='left')
+    elif 'may' in sem.lower():
+        df=pd.merge(df,df.groupby(['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['COLLEGE','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    elif 'FALL SEMESTER'.lower() in sem.lower():
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+    else:
+        df=pd.merge(df,df.groupby(['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'])[time].agg(percentile(95)).astype(int).reset_index(),on=['INST_METHOD_CONSOLIDATED', 'SEMESTER_USE'],how='left')
+
+    print('-------> Reached step 5')
+
+    #### Data Manipulation to do the following:
+    #- Filter for filters provided in config file
+    #- Fill each section till last available sections date within a Course level
+    #- Group by at College X Course X Modality X Session length level
+    #- Join back initial data
+
+
+
+    dup=pd.DataFrame([i+1 for i in range(max(df[str(time)+'_x']))])
+    dup.columns=[str(time)+"_x"]
+    dup['cjoin']=1
+    print('-------> Reached step 6')
+    section=pd.DataFrame([i for i in df[section_id].unique()])
+    section.columns=[section_id]
+    section['cjoin']=1
+    print('-------> Reached step 7')
+    dupXsection=pd.merge(dup,section,on='cjoin')
+    print(len(dupXsection))
+    # df['cjoin']=1
+    # dup
+    section_dup=pd.merge(dupXsection,df,how='left',on=[section_id,str(time)+"_x"])
+    # section_dup.head()
+    print('-------> Reached step 8')
+    section_dup[[course, enrolment,str(time)+"_y"]] = section_dup[[course, enrolment,str(time)+"_y"]].fillna(section_dup.groupby([section_id])[[course, enrolment,str(time)+"_y"]].ffill())
+    section_dup=section_dup[[course,section_id,str(time)+"_x",str(time)+"_y",enrolment]].sort_values(by=[course,section_id])
+    print('-------> Reached step 9')
+    section_dup=pd.merge(section_dup,df[[course,section_id,str(time)+'_y']].drop_duplicates(),on=section_id)
+    del(section_dup[str(course)+'_x'])
+    del(section_dup[str(time)+'_y_x'])
+    print('-------> Reached step 10')
+    section_dup.columns=[section_id,'time','enrolment','course','max_time']
+    print('-------> Reached step 11')
+    section_dup=section_dup[section_dup['time']<=section_dup['max_time']]
+#    section_dup=section_dup[section_dup[str(time)+"_x"]<=section_dup[str(time)+"_y_y"]]
+    section_dup['enrolment'].fillna(0,inplace=True)
+
+
+    print('-------> Reached step 12')
+    print(len(section_dup))
+    section_dup=section_dup.drop_duplicates()
+    print(len(df_orig))
+    print('-------> Reached step 13')
+    #Subset the original columns that need to be in the dataset
+    joinback=df_orig[['ACADEMIC_YEAR', 'SEMESTER', 'COLLEGE', 'SAC_COURSE_NAME',
+           'INST_METHOD_CONSOLIDATED',
+            section_id]].drop_duplicates()
+
+    print(len(joinback))
+    print('-------> Reached step 14')
+    joinback[section_id]=joinback[section_id].astype(int)
+    section_dup=pd.merge(section_dup,joinback,on=section_id,how='left')
+    section_dup=section_dup.drop_duplicates()
+    len(section_dup)
+#    section_dup['SEMESTER_USE']=section_dup.apply(lambda x: x['Semester'] if x['Semester']!='FALL SEMESTER' else x['WEEK_BUCKET_FINAL'],axis=1)
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER']
+    section_dup['SEMESTER_USE']=section_dup['SEMESTER_USE'].astype(str)
+    print('-------> Reached step 15')
+    section_dup['enrolment']=section_dup['enrolment'].astype(float).astype(int)
+    model_level=section_dup.groupby(['COLLEGE', 'SAC_COURSE_NAME','INST_METHOD_CONSOLIDATED', 'SEMESTER_USE','time'])['enrolment'].sum().reset_index()
+
+    model_level['GROUP1']=model_level['COLLEGE'].map(str) +'_'+ model_level['SAC_COURSE_NAME'].map(str) +'_'+ model_level['INST_METHOD_CONSOLIDATED'].map(str) +'_'+ model_level['SEMESTER_USE'].map(str)
+    model_level=model_level[['GROUP1','time','enrolment']]
+    model_level['FIL']=1
+    print('-------> Reached step 16')
+    model_level.columns=['GROUP1','TIME','ENROLLMENT','FIL']
+    d1=pd.DataFrame({'Variable': ['sem', 'ay','path','run_id','start_trim','end_trim'], 'value': [sem, ay,home_location,run_id,start_trim,end_trim]})
+    d1.to_sql('r_config',db.conn,if_exists='replace')
+    d1.to_sql('r_config',db.conn, if_exists='replace')
+    #Sample - Please remove later
+    #model_level=model_level[model_level['GROUP1']=='Richland CollegeGOVT-2305F2F16']
+    print('-------> Reached step 17')
+    model_level.to_sql("autotest_{}_{}".format(ay,sem),db.conn,if_exists='replace')
+    # Call R script 
+    
+    proc = subprocess.Popen([r"{}\Rscript.exe".format(r_location),"master_code.R"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.path.join(home_location,'predictive_curves'))
+    stdout, stderr = proc.communicate()
+#    print(stdout)
+    print(stderr)
+
+
+def getaccuracy(summary,default):
+    default=default[['GROUP1','ENROLLMENT']]
+    default.columns=['GROUP1','DEFAULT']
+    default.head()
+    sumdefault=pd.merge(summary,default,on='GROUP1',how='left')
+    sumdefault.head()
+    # sumdefault.pivot(index=['GROUP1', 'MODEL_ID','ENROLLMENT','DEFAULT'],columns=['TYPE'], values=['PREDICTION'])
+    sumdefault=sumdefault[['GROUP1','DAYS_PASSED','MODEL_ID','ENROLLMENT','DEFAULT','TYPE','PREDICTION']]
+    sumdefault=sumdefault.set_index(['GROUP1','DAYS_PASSED','MODEL_ID','ENROLLMENT','DEFAULT','TYPE']).unstack(level=-1).reset_index()
+    sumdefault.head()
+
+    types=summary['TYPE'].unique()
+    types.sort()
+
+    sumdefault.columns=[*['GROUP1','DAYS_PASSED','MODEL_ID', 'ENROLLMENT','DEFAULT'],*types]
+    sumdefault.head()
+
+    for i in [*types,*['DEFAULT']]:
+        sumdefault[i+"_ERROR"]=abs(sumdefault[i]/sumdefault['ENROLLMENT']-1)
+        sumdefault[i+'_SUMPRODUCT']=sumdefault[i+'_ERROR']*sumdefault['ENROLLMENT']
+
+    sumdefault['BESTFIT']=sumdefault[[i+"_SUMPRODUCT" for i in types]].idxmin(axis=1)
+    sumdefault.head()
+
+    sumdefault['BESTFIT_ERROR']=sumdefault[[i+"_ERROR" for i in types]].apply(np.nanmin,axis=1)
+    sumdefault['BESTFIT_SUMPRODUCT']=sumdefault[[i+"_SUMPRODUCT" for i in types]].apply(np.nanmin,axis=1)
+    sumdefault['BESTFITvsDEFAULT']=sumdefault[['BESTFIT_SUMPRODUCT','DEFAULT_SUMPRODUCT']].idxmin(axis=1)
+    sumdefault['BESTFITvsDEFAULT']=sumdefault['BESTFITvsDEFAULT'].fillna("NEW")
+    sumdefault['isdefaultbetter'] = sumdefault['BESTFITvsDEFAULT'].apply(lambda x: 1 if 'DEFAULT' in x else 0)
+    sumdefault['BESTFIT']=sumdefault['BESTFIT'].str.replace("_SUMPRODUCT","")
+    sumdefault['DEFAULT']=sumdefault['DEFAULT'].fillna("NEW")
+    sumdefault['ENROLLMENT_GROUP1']=sumdefault.apply(lambda x: (x['DEFAULT']=="NEW" and ("NEW",) or ((x['ENROLLMENT']>300 and ("greater than 300",) or ((x['ENROLLMENT']>100 and ("101-300",) or ((x['ENROLLMENT']>25 and ("26-100",) or ("less than 25",))[0],))[0],))[0],))[0],axis=1)
+    print(len(sumdefault[['GROUP1','MODEL_ID','BESTFIT','isdefaultbetter']]))
+    print(len(sumdefault[['GROUP1','MODEL_ID','BESTFIT','isdefaultbetter']].drop_duplicates()))
+    print(len(sumdefault.drop_duplicates(subset=['GROUP1','MODEL_ID'])))
+    sumdefault=sumdefault[['GROUP1','DAYS_PASSED','MODEL_ID','BESTFIT','BESTFIT_ERROR','ENROLLMENT_GROUP1','ENROLLMENT','DEFAULT','DEFAULT_ERROR','isdefaultbetter']]
+    sumdefault.columns=['GROUP1','DAYS_PASSED','MODEL_ID','BESTFIT','BESTFIT_ERROR','ENROLLMENT_GROUP1','OVERALL_ENROLLMENT','DEFAULT','DEFAULT_ERROR','isdefaultbetter']
+    sumdefault.head()
+    return sumdefault
+
+def bestfits(ay,ay_default,sem,run_id):
+    powerbi_input=pd.read_sql("select * from {}_{}_powerBI_output where run_id={}".format(ay,sem,run_id),db.conn)
+    summary_input=pd.read_sql("select * from {}_{}_modelSummary_output where run_id={}".format(ay,sem,run_id),db.conn)
+    default_input=pd.read_sql("select * from {}_{}_default_output where run_id={}".format(ay_default,sem,run_id),db.conn)
+    default_time=pd.read_sql("autotest_{}_{}".format(ay_default,sem), db.conn)
+
+    accuracy=getaccuracy(summary_input,default_input)
+    print(len(powerbi_input))
+    powerbi_input=pd.merge(powerbi_input,accuracy,on=['GROUP1','MODEL_ID'],how='left')
+    print(len(powerbi_input.drop_duplicates()))
+
+    powerbi_input=powerbi_input[['GROUP1', 'MODEL', 'DAYS_PASSED_x', 'MODEL_ID', 'TIME', 'ENROLLMENT',
+       'PREDICTION', 'TYPE', 'BESTFIT', 'BESTFIT_ERROR',
+       'ENROLLMENT_GROUP1', 'OVERALL_ENROLLMENT', 'DEFAULT', 'DEFAULT_ERROR',
+       'isdefaultbetter']]
+    powerbi_input.columns=['GROUP1', 'MODEL', 'DAYS_PASSED', 'MODEL_ID', 'TIME', 'ENROLLMENT',
+           'PREDICTION', 'TYPE', 'BESTFIT', 'BESTFIT_ERROR',
+           'ENROLLMENT_GROUP1', 'OVERALL_ENROLLMENT', 'DEFAULT', 'DEFAULT_ERROR',
+           'isdefaultbetter']
+    idx=np.where(powerbi_input['TYPE']==powerbi_input['BESTFIT'])
+    powerbi_input=powerbi_input.loc[idx]
+    
+    pbi=pd.merge(powerbi_input,default_time.rename(columns={"ENROLLMENT": "ROLLOVER"}), on=['GROUP1','TIME'],how='left')
+
+    del powerbi_input
+    del default_time
+    del default_input
+    del summary_input
+    pbi['trim_status']='Trimmed'
+    pbi['term']=sem
+    pbi['year_status']=ay.replace("_","-")
+    pbi['DEFAULT']=pbi['DEFAULT'].replace("NEW",0)
+    pbi_m8=pbi[pbi['MODEL_ID']=='MODEL 8']
+    powerbiinputl3=pd.merge(pbi_m8,pbi_m8.groupby(['GROUP1','term','year_status'])['TIME'].max().reset_index(),on=['GROUP1','term','year_status','TIME'],how='inner')
+
+    pbi['run_id']=run_id
+    powerbiinputl3['run_id']=run_id
+#    pbi.to_sql("powerbi_research_{}_{}".format(ay,sem),db.conn, if_exists='replace')
+    pbi.to_sql('research_curves',db.conn,if_exists='append')
+    powerbiinputl3.to_sql("powerbi_bestfit_model8_{}_{}".format(ay,sem), db.conn, if_exists='replace')
+    accuracy.to_sql("bestfit_{}_{}".format(ay,sem),db.conn,if_exists='replace')
+
+
+
+def run_curve_fit(sem,scoring_ay,run_id):
+    f = open("setpath.R", "w")
+    f.write("path<-{}".format("'"+str(os.path.dirname(os.getcwd())).replace('\\','//')+"'"))
+    f.close()
+    
+    course='SAC_COURSE_NAME'
+    time='DAYS_AFTER_REG_START'
+    section_id='SECTION_ID'
+    enrolment='ENROLLMENT_COUNT'
+    
+    scoring_ay=scoring_ay.replace('-','_')
+    ay=default(scoring_ay)
+    ay_default=default(ay)
+    ay_default2=default(ay_default)
+    #Import data
+    df_orig=pd.read_sql_query("SELECT * FROM Distribution_Data_CF where SEMESTER LIKE '%{}%'".format(sem), db.conn)
+    #df_orig=pd.read_sql_query("SELECT * FROM Distribution_Data_CF where SEMESTER LIKE '%{}%' and sac_course_name ='ACCT-2301'".format(sem), db.conn)
+#    df_orig['SEMESTER']
+
+
+
+    df_orig=df_orig[df_orig['SEMESTER'].notna()]
+    df_orig['SECTION_ID']=df_orig['SECTION_ID'].apply(convert_str)
+    print("step 1/6 completed")
+    #Data Preparation
+    #Import school to college mappings
+
+
+    df_orig.columns
+    df_orig['ACADEMIC_YEAR'].value_counts()
+
+    curve_fits(df_orig, ay, sem, time, course,section_id,enrolment,home_location,run_id)
+    print("step 2/6 completed")
+    curve_fits(df_orig, ay_default, sem,  time, course,section_id,enrolment,home_location,run_id)
+    print("step 3/6 completed")
+    curve_fits(df_orig, ay_default2, sem,  time, course,section_id,enrolment,home_location,run_id)
+    print("step 4/6 completed")
+
+
+
+    bestfits(ay,ay_default,sem, run_id)
+    print("step 5/6 completed")
+
+    bestfits(ay_default,ay_default2,sem, run_id)
+    print("step 6/6 completed")
+
+
+
+if __name__=="__main__":
+    # TODO read YAML here and create variables and then pass it on run_curve_fit()
+    # TODO those variable will be passed via API.
+    try:
+        from yaml import CLoader as Loader, CDumper as Dumper
+    except ImportError:
+        from yaml import Loader, Dumper
+
+    #Input Parameters
+#    os.chdir('predictive_curves')
+    code_location=os.path.dirname(os.getcwd())
+    config='config'
+
+
+    with open("predictive_curves/{}.yaml".format(config), 'r') as stream:
+        try:
+            config=(yaml.safe_load(stream))
+        except yaml.YAMLError as exc:
+            print(exc)
+    sem = config['sem']
+    scoring_ay=config['scoring_ay']
+    
+    run_curve_fit(sem,scoring_ay,run_id)
+    db.__disconnect__()
